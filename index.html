@@ -300,6 +300,7 @@ input[type=number],input[inputmode=decimal]{font-variant-numeric:tabular-nums}
     <button role="tab" id="tab-programs" aria-selected="true" data-view="programs">Программы</button>
     <button role="tab" id="tab-edit" aria-selected="false" data-view="edit">Конструктор</button>
     <button role="tab" id="tab-log" aria-selected="false" data-view="log">Журнал</button>
+    <button role="tab" id="tab-duel" aria-selected="false" data-view="duel">Дуэли</button>
     <button role="tab" id="tab-body" aria-selected="false" data-view="body">Тело</button>
   </div>
   <section id="v-programs" class="list"></section>
@@ -848,7 +849,7 @@ async function renderDuels(){
     const badge=done?(lead==='me'?'<span class="badge win">Победа</span>':lead==='opp'?'<span class="badge lose">Поражение</span>':'<span class="badge tie">Ничья</span>')
       :(lead==='me'?'<span class="badge win">Вы ведёте</span>':lead==='opp'?'<span class="badge">Отстаёте</span>':'<span class="badge tie">Ровно</span>');
     const row=(id,v,isLead)=>`<div class="duel-row ${isLead?'lead':''}">${av(id)}<span class="who">${esc(nm(id))}</span><span class="val">${v}<small>${M.unit}</small></span><div class="dbar"><i style="width:${(v/max*100).toFixed(1)}%"></i></div></div>`;
-    return `<article class="duel"><div class="duel-head"><h2>${esc(M.label)}: вы против ${esc(nm(opp))}</h2>${badge}</div>
+    return `<article class="duel"><div class="duel-head"><h2>${esc(M.label)} · соперник: ${esc(nm(opp))}</h2>${badge}</div>
       <div class="duel-meta">${dfmt.format(d.startAt)} – ${dfmt.format(d.endAt)} · ${done?'завершена':leftText(d.endAt-now)}</div>
       ${row(me,mv,lead==='me')}${row(opp,ov,lead==='opp')}${stake(d)}
       ${done?`<div class="row"><button class="btn sm" data-act="rematch" data-id="${d.id}">Реванш</button></div>`:''}</article>`};
@@ -871,7 +872,7 @@ function renderDuelForm(){
     <div class="fgroup"><span class="sect" style="margin:0">Что считаем</span><div class="seg" role="radiogroup" aria-label="Что считаем">${Object.entries(METRICS).map(([k,m])=>`<button role="radio" aria-checked="${f.metric===k}" data-act="metric" data-v="${k}">${m.label}</button>`).join('')}</div>
     <p class="hint">${METRICS[f.metric].hint}</p></div>
     <div class="fgroup"><span class="sect" style="margin:0">Сколько длится</span><div class="seg" role="radiogroup" aria-label="Длительность">${[3,7,14].map(n=>`<button role="radio" aria-checked="${f.days===n}" data-act="days" data-v="${n}">${n} дней</button>`).join('')}</div></div>
-    <label class="f">На кону, по желанию<input id="d-stake" maxlength="80" value="${esc(f.stake)}" placeholder="Например, проигравший угощает кофе"></label>
+    <label class="f">На кону, по желанию<input id="d-stake" maxlength="80" value="${esc(f.stake)}" placeholder="Например, кофе"></label>
     <div class="row"><button class="btn primary" data-act="create">Бросить вызов</button></div></div>`;
   $('#d-stake').oninput=e=>{f.stake=e.target.value};
 }
@@ -1326,6 +1327,335 @@ initCloud();
     rd.onerror=()=>{msg='Не получилось открыть файл. Попробуйте ещё раз.';renderLog()};rd.readAsText(file)}
 })();
 if('serviceWorker' in navigator){addEventListener('load',()=>{navigator.serviceWorker.register('sw.js').catch(()=>{})})}
+
+/* =====================================================================
+   Own cloud on Supabase: sign-in, sync across devices, private duels.
+   Every person sees only their own data; a duel's names and score are
+   visible only to its two participants (enforced by the database rules).
+   ===================================================================== */
+const SB={url:'https://szexaygollllbcjuplnz.supabase.co',key:'sb_publishable_n2_9wfaGLwxP7ToVjgoq6g_hht13FRQ'};
+const SESSION_KEY='ct-sb-session',OWNER_KEY='ct-sb-owner',DIRTY_KEY='ct-sb-dirty';
+const sb={session:store.get(SESSION_KEY,null),me:null,name:'',refreshing:null,pulling:null,timers:{},mode:'signin',msg:'',msgKind:'',busy:false};
+if(sb.session&&!(sb.session.user&&sb.session.user.id))sb.session=null;
+
+Object.assign(SYNC_TEXT,{
+  sbout:'Войдите, чтобы данные были на всех устройствах и работали дуэли',
+  sbsync:'Синхронизирую…',
+  sbcloud:'Вы вошли · данные синхронизируются',
+  sberror:'Нет связи с облаком · всё сохранено на устройстве и отправится позже'});
+
+/* ---------- low-level API ---------- */
+function sbHeaders(auth,extra){const h={apikey:SB.key,'Content-Type':'application/json'};if(auth&&sb.session)h.Authorization='Bearer '+sb.session.access_token;return Object.assign(h,extra||{})}
+async function sbAuth(path,body,{method='POST',auth=false}={}){
+  const r=await fetch(SB.url+'/auth/v1/'+path,{method,headers:sbHeaders(auth),body:body?JSON.stringify(body):undefined});
+  let j=null;try{j=await r.json()}catch(e){}
+  if(!r.ok){const err=new Error((j&&(j.msg||j.error_description||j.message||j.error))||('HTTP '+r.status));err.status=r.status;err.code=j&&(j.error_code||j.code);throw err}
+  return j}
+function setSession(j){
+  if(!j||!j.access_token){sb.session=null;try{localStorage.removeItem(SESSION_KEY)}catch(e){}return}
+  const u=j.user||(sb.session&&sb.session.user)||{};
+  sb.session={access_token:j.access_token,refresh_token:j.refresh_token||(sb.session&&sb.session.refresh_token),
+    expires_at:j.expires_at||Math.floor(Date.now()/1000)+(+j.expires_in||3600),
+    user:{id:u.id,email:u.email,name:(u.user_metadata&&u.user_metadata.name)||(u.name)||''}};
+  store.set(SESSION_KEY,sb.session)}
+async function ensureFresh(){
+  if(!sb.session)return false;
+  if(sb.session.expires_at-Date.now()/1000>90)return true;
+  if(!sb.refreshing)sb.refreshing=sbAuth('token?grant_type=refresh_token',{refresh_token:sb.session.refresh_token})
+    .then(j=>{setSession(j);return true})
+    .catch(e=>{if(e.status>=400&&e.status<500){signedOut(true)}return false})
+    .finally(()=>{sb.refreshing=null});
+  return sb.refreshing}
+async function rest(path,{method='GET',body,prefer}={}){
+  if(!(await ensureFresh()))throw Object.assign(new Error('signed_out'),{status:401});
+  const go=()=>fetch(SB.url+'/rest/v1/'+path,{method,headers:sbHeaders(true,prefer?{Prefer:prefer}:null),body:body!==undefined?JSON.stringify(body):undefined});
+  let r=await go();
+  if(r.status===401&&sb.session){sb.session.expires_at=0;if(await ensureFresh())r=await go()}
+  const txt=await r.text();let j=null;try{j=txt?JSON.parse(txt):null}catch(e){}
+  if(!r.ok){const err=new Error((j&&(j.message||j.msg||j.hint))||('HTTP '+r.status));err.status=r.status;err.code=j&&j.code;throw err}
+  return j}
+const UPSERT='resolution=merge-duplicates,return=minimal';
+
+/* ---------- sync of programs, body, workouts ---------- */
+const dirty=()=>store.get(DIRTY_KEY,{});
+function markDirty(k,v){const d=dirty();if(v)d[k]=1;else delete d[k];store.set(DIRTY_KEY,d)}
+function okSync(){if(sb.me)setSync('sbcloud')}
+function failSync(e){if(!sb.me)return;if(e&&e.status===401)return;setSync('sberror')}
+async function pushDoc(what){if(!sb.me)return;markDirty(what,true);
+  try{await rest('user_data',{method:'POST',body:[{user_id:sb.me,[what]:what==='programs'?programs:body,updated_at:new Date().toISOString()}],prefer:UPSERT});
+    markDirty(what,false);okSync()}catch(e){failSync(e)}}
+function queuePush(what){if(!sb.me)return;markDirty(what,true);clearTimeout(sb.timers[what]);sb.timers[what]=setTimeout(()=>pushDoc(what),700)}
+async function pushWorkouts(list){if(!sb.me||!list.length)return;
+  for(let i=0;i<list.length;i+=200){await rest('workouts',{method:'POST',body:list.slice(i,i+200).map(e=>({user_id:sb.me,at:e.at,data:e})),prefer:UPSERT})}}
+cloud.writePrograms=function(){queuePush('programs')};
+cloud.write=function(id){if(id==='body')queuePush('body');else if(id==='programs')queuePush('programs')};
+cloud.addEntry=function(e){if(!sb.me)return;pushWorkouts([e]).then(()=>{okSync();schedulePushScores()},failSync)};
+
+function rerenderAll(){if(view==='programs')renderPrograms();if(view==='log')renderLog();if(view==='body')renderBody();if(view==='duel'){renderDuels();renderDuelForm()}}
+async function pull(){
+  if(!sb.me)return;if(sb.pulling)return sb.pulling;
+  sb.pulling=(async()=>{
+    const me=sb.me;
+    const [ud,ws]=await Promise.all([rest('user_data?select=programs,body&user_id=eq.'+me),rest('workouts?select=data&order=at.asc&limit=10000')]);
+    if(sb.me!==me)return;
+    const owner=store.get(OWNER_KEY,null);const sameOwner=owner===me,fresh=!owner;
+    const d=dirty();const remote=ud&&ud[0];
+    const rp=remote&&Array.isArray(remote.programs)?remote.programs:[];
+    const rb=remote&&Array.isArray(remote.body)?remote.body:[];
+    const rl=(ws||[]).map(x=>x.data).filter(e=>e&&typeof e.at==='number');
+    // programs
+    if(!rp.length){if(!fresh&&!sameOwner)programs=SAMPLES.map(cloneP);await pushDoc('programs')}
+    else if(sameOwner&&d.programs){await pushDoc('programs')}
+    else if(fresh){const sampleIds=SAMPLES.map(p=>p.id);const extra=programs.filter(p=>!sampleIds.includes(p.id)&&!rp.some(x=>x.id===p.id));
+      const missing=SAMPLES.filter(sp=>!rp.some(p=>p.id===sp.id));
+      programs=[...missing.map(cloneP),...rp,...extra];migrateSamples(programs);if(extra.length||missing.length)await pushDoc('programs')}
+    else{programs=rp;if(migrateSamples(programs))await pushDoc('programs')}
+    // body measurements
+    if(fresh){const m=new Map(rb.map(x=>[x.id,x]));let add=0;body.forEach(x=>{if(x&&x.id&&!m.has(x.id)){m.set(x.id,x);add++}});body=[...m.values()];if(add||(!remote&&body.length))await pushDoc('body')}
+    else if(sameOwner&&d.body){await pushDoc('body')}
+    else body=rb;
+    // workouts: union with anything recorded on this device that never reached the cloud
+    const seen=new Set(rl.map(e=>e.at));
+    const localOnly=(fresh||sameOwner)?log.filter(e=>e&&!seen.has(e.at)):[];
+    if(localOnly.length)await pushWorkouts(localOnly);
+    log=[...rl,...localOnly].sort((a,b)=>a.at-b.at);
+    store.set('ct-programs',programs);store.set('ct-log',log);store.set('ct-body',body);store.set(OWNER_KEY,me);
+    okSync();rerenderAll();loadDuels();
+  })().catch(e=>{failSync(e)}).finally(()=>{sb.pulling=null});
+  return sb.pulling}
+
+/* ---------- sign-in state ---------- */
+async function afterSignIn(){
+  sb.me=sb.session.user.id;setSync('sbsync');
+  try{const p=await rest('profiles?select=display_name&id=eq.'+sb.me);sb.name=(p&&p[0]&&p[0].display_name)||'';
+    if(!sb.name&&sb.session.user.name){sb.name=sb.session.user.name.slice(0,40);await rest('profiles',{method:'POST',body:[{id:sb.me,display_name:sb.name}],prefer:UPSERT})}}
+  catch(e){}
+  await pull();
+  if(!sb.name){sb.mode='name';openAccount()}
+}
+function signedOut(expired){
+  const had=!!sb.me;sb.me=null;sb.name='';setSession(null);
+  Object.values(sb.timers).forEach(clearTimeout);
+  // remove this person's data from the device: it is safe in the cloud
+  if(had||expired){programs=SAMPLES.map(cloneP);log=[];body=[];store.set('ct-programs',programs);store.set('ct-log',log);store.set('ct-body',body);
+    try{localStorage.removeItem(OWNER_KEY);localStorage.removeItem(DIRTY_KEY);localStorage.removeItem('ct-active')}catch(e){}}
+  sbd.duels=[];sbd.scores=[];sbd.names={};sbd.peek=null;
+  setSync('sbout');rerenderAll();
+  if(expired){sb.mode='signin';sb.msg='Сессия закончилась. Войдите снова — данные в облаке на месте.';sb.msgKind='';openAccount()}
+}
+function errRu(e){const m=String(e&&e.message||'').toLowerCase(),c=String(e&&e.code||'');
+  if(!e||e.status===undefined&&/fetch|network|load failed/.test(m))return 'Нет связи с интернетом. Проверьте подключение и попробуйте ещё раз.';
+  if(c==='invalid_credentials'||/invalid login credentials/.test(m))return 'Неверная почта или пароль.';
+  if(c==='email_not_confirmed'||/email not confirmed/.test(m))return 'Почта ещё не подтверждена. Откройте письмо от Supabase и нажмите ссылку подтверждения, затем войдите снова.';
+  if(c==='user_already_exists'||/already registered|already been registered/.test(m))return 'Такая почта уже зарегистрирована. Войдите или восстановите пароль.';
+  if(c==='weak_password'||/password should be|weak password/.test(m))return 'Пароль слишком простой: нужно не меньше 6 символов.';
+  if(c==='over_email_send_rate_limit'||e.status===429||/rate limit/.test(m))return 'Слишком много писем за короткое время. Подождите около часа и попробуйте снова.';
+  if(c==='validation_failed'||/invalid.*email|email.*invalid/.test(m))return 'Проверьте адрес почты.';
+  if(c==='signup_disabled')return 'Регистрация сейчас закрыта.';
+  if(c==='same_password')return 'Новый пароль совпадает со старым.';
+  return 'Не получилось: '+(e&&e.message||'неизвестная ошибка')+'. Попробуйте ещё раз.'}
+
+/* ---------- account sheet ---------- */
+document.body.insertAdjacentHTML('beforeend',`<div class="sheet" id="acct" hidden role="dialog" aria-modal="true" aria-labelledby="acct-title"><div class="sheet-card acct-card" id="acct-card"></div></div>`);
+const acctStyle=document.createElement('style');acctStyle.textContent=`
+.sync{cursor:pointer;font:inherit;font-size:13px;text-align:left}
+.sync:hover{border-color:var(--cta)}
+.sync[data-s="sbcloud"] i{background:var(--cta)}
+.sync[data-s="sberror"] i{background:#FF8A6E}
+.sync[data-s="sbout"]{border-color:var(--cta);color:var(--hero-ink)}
+.sync[data-s="sbout"] i{background:var(--cta)}
+.acct-card{gap:14px}
+.acct-card form{display:flex;flex-direction:column;gap:12px}
+.acct-card .linkbtn{background:none;border:0;padding:4px 0;color:var(--fg);font:600 14px var(--f-body);text-decoration:underline;text-decoration-color:var(--cta);text-decoration-thickness:2px;text-underline-offset:3px;cursor:pointer;text-align:left}
+.acct-msg{margin:0;font-size:14px;padding:10px 12px;border-radius:12px;background:var(--soft)}
+.acct-msg.err{background:color-mix(in srgb,var(--work) 12%,var(--surface));color:var(--fg)}
+.acct-msg.ok{background:color-mix(in srgb,var(--cta) 35%,var(--surface))}
+.acct-who{font-size:14px;color:var(--muted);margin:-6px 0 0;overflow-wrap:anywhere}
+.codebox{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;background:var(--soft);border-radius:16px;padding:12px 14px}
+.codebox b{font:800 28px/1 var(--f-mono);letter-spacing:.14em;font-variant-numeric:tabular-nums}
+.codein{display:flex;gap:8px}
+.codein input{text-transform:uppercase;letter-spacing:.12em;font-weight:700;font-size:18px;min-width:0;flex:1}
+.codein input::placeholder{text-transform:none;letter-spacing:0;font-weight:500;font-size:15px}
+`;document.head.appendChild(acctStyle);
+const syncEl=$('#sync');if(syncEl){const btn=document.createElement('button');btn.type='button';btn.id='sync';btn.className='sync';btn.dataset.s=syncEl.dataset.s;btn.setAttribute('aria-live','polite');btn.innerHTML=syncEl.innerHTML;btn.setAttribute('aria-haspopup','dialog');syncEl.replaceWith(btn);btn.onclick=()=>{sb.msg='';openAccount()}}
+function openAccount(){renderAccount();$('#acct').hidden=false;const f=$('#acct-card input,#acct-card button');if(f)try{f.focus()}catch(e){}}
+function closeAccount(){$('#acct').hidden=true;sb.msg=''}
+$('#acct').addEventListener('click',e=>{if(e.target.id==='acct')closeAccount()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('#acct').hidden)closeAccount()});
+function msgHtml(){return sb.msg?`<p class="acct-msg ${sb.msgKind}" role="status">${esc(sb.msg)}</p>`:''}
+function renderAccount(){
+  const c=$('#acct-card');const busy=sb.busy?'disabled':'';
+  if(sb.mode==='recovery'){c.innerHTML=`<h2 id="acct-title">Новый пароль</h2>${msgHtml()}
+    <form id="af"><label class="f">Новый пароль<input id="a-pass" type="password" autocomplete="new-password" minlength="6" required></label>
+    <button class="btn primary" ${busy}>Сохранить пароль</button></form><button class="btn ghost" id="a-close" type="button">Закрыть</button>`}
+  else if(sb.me&&sb.mode==='name'){c.innerHTML=`<h2 id="acct-title">Как вас зовут?</h2><p class="hint">Имя увидят только ваши соперники в дуэлях.</p>${msgHtml()}
+    <form id="af"><label class="f">Имя<input id="a-name" maxlength="40" autocomplete="nickname" value="${esc(sb.name)}" required></label><button class="btn primary" ${busy}>Сохранить</button></form>`}
+  else if(sb.me){c.innerHTML=`<h2 id="acct-title">Аккаунт</h2><p class="acct-who">${esc(sb.session.user.email||'')}</p>${msgHtml()}
+    <form id="af"><label class="f">Имя для дуэлей<input id="a-name" maxlength="40" value="${esc(sb.name)}"></label><button class="btn" ${busy}>Сохранить имя</button></form>
+    <p class="hint">Тренировки, программы, веса и замеры видите только вы. Имя и счёт видит лишь соперник в общей дуэли.</p>
+    <button class="btn primary" id="a-sync" type="button" ${busy}>Синхронизировать сейчас</button>
+    <button class="btn ghost danger" id="a-out" type="button" ${busy}>Выйти из аккаунта</button>
+    <button class="btn ghost" id="a-close" type="button">Закрыть</button>`}
+  else if(sb.mode==='signup'){c.innerHTML=`<h2 id="acct-title">Регистрация</h2>${msgHtml()}
+    <form id="af"><label class="f">Имя (увидят только соперники)<input id="a-name" maxlength="40" autocomplete="nickname" required></label>
+    <label class="f">Почта<input id="a-email" type="email" autocomplete="email" inputmode="email" required></label>
+    <label class="f">Пароль, не меньше 6 символов<input id="a-pass" type="password" autocomplete="new-password" minlength="6" required></label>
+    <button class="btn primary" ${busy}>Зарегистрироваться</button></form>
+    <button class="linkbtn" id="a-to-in" type="button">Уже есть аккаунт? Войти</button><button class="btn ghost" id="a-close" type="button">Закрыть</button>`}
+  else if(sb.mode==='forgot'){c.innerHTML=`<h2 id="acct-title">Восстановить пароль</h2><p class="hint">Пришлём письмо со ссылкой. Откройте её, задайте новый пароль и войдите в приложении.</p>${msgHtml()}
+    <form id="af"><label class="f">Почта<input id="a-email" type="email" autocomplete="email" inputmode="email" required></label><button class="btn primary" ${busy}>Отправить ссылку</button></form>
+    <button class="linkbtn" id="a-to-in" type="button">Вернуться ко входу</button><button class="btn ghost" id="a-close" type="button">Закрыть</button>`}
+  else{c.innerHTML=`<h2 id="acct-title">Вход</h2><p class="hint">После входа тренировки сохраняются в облаке и видны на всех ваших устройствах, а ещё работают дуэли.</p>${msgHtml()}
+    <form id="af"><label class="f">Почта<input id="a-email" type="email" autocomplete="username" inputmode="email" required></label>
+    <label class="f">Пароль<input id="a-pass" type="password" autocomplete="current-password" required></label>
+    <button class="btn primary" ${busy}>Войти</button></form>
+    <button class="linkbtn" id="a-to-up" type="button">Нет аккаунта? Зарегистрироваться</button>
+    <button class="linkbtn" id="a-to-fg" type="button">Забыли пароль?</button><button class="btn ghost" id="a-close" type="button">Закрыть</button>`}
+  const on=(id,fn)=>{const el=$('#'+id);if(el)el.onclick=fn};
+  on('a-close',closeAccount);on('a-to-in',()=>{sb.mode='signin';sb.msg='';renderAccount()});on('a-to-up',()=>{sb.mode='signup';sb.msg='';renderAccount()});on('a-to-fg',()=>{sb.mode='forgot';sb.msg='';renderAccount()});
+  on('a-sync',async()=>{setSync('sbsync');await pull();sb.msg='Готово, данные синхронизированы.';sb.msgKind='ok';renderAccount()});
+  on('a-out',async()=>{const b=$('#a-out');if(!b.dataset.sure){b.dataset.sure='1';b.textContent='Точно выйти? Данные останутся в облаке';return}
+    try{await sbAuth('logout',null,{auth:true})}catch(e){}signedOut(false);sb.mode='signin';sb.msg='Вы вышли. Данные сохранены в облаке и вернутся после входа.';sb.msgKind='ok';renderAccount()});
+  const f=$('#af');if(f)f.onsubmit=e=>{e.preventDefault();submitAccount()};
+}
+async function submitAccount(){
+  if(sb.busy)return;const v=id=>{const el=$('#'+id);return el?el.value.trim():''};
+  sb.busy=true;sb.msg='';
+  try{
+    if(sb.mode==='recovery'){await ensureFresh();const r=await fetch(SB.url+'/auth/v1/user',{method:'PUT',headers:sbHeaders(true),body:JSON.stringify({password:$('#a-pass').value})});
+      if(!r.ok){let j=null;try{j=await r.json()}catch(e){}const err=new Error((j&&(j.msg||j.message))||'HTTP '+r.status);err.code=j&&j.error_code;err.status=r.status;throw err}
+      sb.mode='account';sb.msg='Пароль изменён. Теперь им можно входить на всех устройствах.';sb.msgKind='ok';await afterSignIn()}
+    else if(sb.me){const name=v('a-name').slice(0,40);if(!name){sb.msg='Введите имя.';sb.msgKind='err'}else{
+      await rest('profiles',{method:'POST',body:[{id:sb.me,display_name:name,updated_at:new Date().toISOString()}],prefer:UPSERT});sb.name=name;
+      const wasName=sb.mode==='name';sb.mode='account';sb.msg=wasName?'':'Имя сохранено.';sb.msgKind='ok';if(wasName){sb.busy=false;closeAccount();return}}}
+    else if(sb.mode==='signup'){const name=v('a-name').slice(0,40),email=v('a-email'),pass=$('#a-pass').value;
+      const j=await sbAuth('signup',{email,password:pass,data:{name}});
+      if(j&&j.access_token){setSession(j);sb.mode='account';await afterSignIn();sb.msg='Аккаунт создан, вы вошли.';sb.msgKind='ok'}
+      else if(j&&j.user&&Array.isArray(j.user.identities)&&j.user.identities.length===0){sb.msg='Такая почта уже зарегистрирована. Войдите или восстановите пароль.';sb.msgKind='err';sb.mode='signin'}
+      else{sb.mode='signin';sb.msg=`Почти готово! Мы отправили письмо на ${email}. Откройте его и нажмите ссылку подтверждения (можно на любом устройстве), затем войдите здесь с паролем. Письмо может прийти в «Спам».`;sb.msgKind='ok'}}
+    else if(sb.mode==='forgot'){await sbAuth('recover',{email:v('a-email')});sb.mode='signin';sb.msg='Письмо отправлено. Откройте ссылку из него, задайте новый пароль и войдите.';sb.msgKind='ok'}
+    else{const j=await sbAuth('token?grant_type=password',{email:v('a-email'),password:$('#a-pass').value});setSession(j);sb.mode='account';await afterSignIn();
+      if(sb.mode==='name'){sb.busy=false;renderAccount();return}sb.busy=false;closeAccount();return}
+  }catch(e){sb.msg=errRu(e);sb.msgKind='err'}
+  sb.busy=false;if(!$('#acct').hidden)renderAccount()}
+
+/* ---------- private duels by code ---------- */
+const sbd={duels:[],scores:[],names:{},loaded:false,peek:null,code:'',justCreated:null,f:{metric:'workouts',days:7,stake:''},pushT:null,lastPushed:''};
+const CODE_CHARS='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const newCode=()=>Array.from(crypto.getRandomValues(new Uint8Array(6)),b=>CODE_CHARS[b%CODE_CHARS.length]).join('');
+const mapDuel=x=>({id:x.id,a:x.a,b:x.b,invite:x.invite,metric:x.metric,days:x.days,stake:x.stake||'',createdAt:+x.created_at,startAt:x.start_at?+x.start_at:null,endAt:x.end_at?+x.end_at:null});
+async function loadDuels(){if(!sb.me)return;
+  try{const [ds,sc,pr]=await Promise.all([rest('duels?select=*&order=created_at.desc&limit=200'),rest('duel_scores?select=*'),rest('profiles?select=id,display_name')]);
+    sbd.duels=(ds||[]).map(mapDuel);sbd.scores=sc||[];sbd.names={};(pr||[]).forEach(p=>{sbd.names[p.id]=p.display_name});sbd.loaded=true;
+    if(view==='duel')renderDuels();schedulePushScores()}catch(e){failSync(e)}}
+function schedulePushScores(){clearTimeout(sbd.pushT);sbd.pushT=setTimeout(pushScores,900)}
+async function pushScores(){if(!sb.me)return;const now=Date.now();
+  const rows=sbd.duels.filter(d=>d.startAt&&(d.a===sb.me||d.b===sb.me)&&now<d.endAt+2*DAY).map(d=>({duel_id:d.id,user_id:sb.me,...duelScoresFor(d),updated_at:new Date().toISOString()}));
+  const key=JSON.stringify(rows.map(r=>[r.duel_id,r.workouts,r.minutes,r.exercises]));if(!rows.length||key===sbd.lastPushed)return;
+  try{await rest('duel_scores',{method:'POST',body:rows,prefer:UPSERT});sbd.lastPushed=key}catch(e){}}
+function oppScore(d,opp){const r=sbd.scores.find(s=>s.duel_id===d.id&&s.user_id===opp);return r?(+r[d.metric]||0):0}
+const shareUrl=()=>location.origin+location.pathname;
+renderDuels=function(){
+  const el=$('#duel-list');
+  if(!sb.me){el.innerHTML=`<div class="card empty"><h2>Дуэли работают после входа</h2><p>Войдите или зарегистрируйтесь — это бесплатно. Соревноваться можно с тем, кому вы отправите код вызова. Никто другой ваших дуэлей не видит.</p><button class="btn primary" id="sbd-login" type="button">Войти или зарегистрироваться</button></div>`;
+    $('#duel-form').innerHTML='';$('#sbd-login').onclick=()=>{sb.mode='signin';sb.msg='';openAccount()};return}
+  if(!sbd.loaded){el.innerHTML='<p class="hint">Загружаю дуэли…</p>';loadDuels();return}
+  const now=Date.now(),me=sb.me;
+  const nm=id=>id===me?'Вы':(sbd.names[id]||'Соперник');
+  const initials=id=>esc((nm(id)||'?').trim().charAt(0).toUpperCase());
+  const av=id=>`<span class="av" style="display:grid;place-items:center;font-weight:800;color:var(--fg)">${initials(id)}</span>`;
+  const terms=d=>`${METRICS[d.metric]?.label||''} · ${d.days} дн`;
+  const stake=d=>d.stake?`<p class="stake">На кону: ${esc(d.stake)}</p>`:'';
+  const mine=sbd.duels.filter(d=>d.a===me||d.b===me);
+  const active=mine.filter(d=>d.startAt&&now<d.endAt).sort((a,b)=>a.endAt-b.endAt);
+  const waiting=mine.filter(d=>!d.b&&d.a===me).sort((a,b)=>b.createdAt-a.createdAt);
+  const incoming=sbd.duels.filter(d=>!d.b&&d.a!==me&&d.invite===me);
+  const finished=mine.filter(d=>d.startAt&&now>=d.endAt).sort((a,b)=>b.endAt-a.endAt).slice(0,6);
+  const card=(d,done)=>{const opp=d.a===me?d.b:d.a;const M=METRICS[d.metric]||METRICS.workouts;
+    const mv=duelScoresFor(d)[d.metric]||0,ov=oppScore(d,opp);const max=Math.max(mv,ov,1);const lead=mv>ov?'me':ov>mv?'opp':'tie';
+    const badge=done?(lead==='me'?'<span class="badge win">Победа</span>':lead==='opp'?'<span class="badge lose">Поражение</span>':'<span class="badge tie">Ничья</span>')
+      :(lead==='me'?'<span class="badge win">Вы ведёте</span>':lead==='opp'?'<span class="badge">Отстаёте</span>':'<span class="badge tie">Ровно</span>');
+    const row=(id,v,isLead)=>`<div class="duel-row ${isLead?'lead':''}">${av(id)}<span class="who">${esc(nm(id))}</span><span class="val">${v}<small>${M.unit}</small></span><div class="dbar"><i style="width:${(v/max*100).toFixed(1)}%"></i></div></div>`;
+    return `<article class="duel"><div class="duel-head"><h2>${esc(M.label)} · соперник: ${esc(nm(opp))}</h2>${badge}</div>
+      <div class="duel-meta">${dfmt.format(d.startAt)} – ${dfmt.format(d.endAt)} · ${done?'завершена':leftText(d.endAt-now)}</div>
+      ${row(me,mv,lead==='me')}${row(opp,ov,lead==='opp')}${stake(d)}
+      ${done?`<div class="row"><button class="btn sm" data-sb="rematch" data-id="${d.id}" type="button">Реванш</button></div>`:''}</article>`};
+  let h=`<div class="card"><h2>Принять вызов по коду</h2><p class="hint">Попросите соперника прислать код из его вызова.</p>
+    <form class="codein" id="sbd-codef"><input id="sbd-code" maxlength="12" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Код, напр. K7P2QX" aria-label="Код вызова" value="${esc(sbd.code)}"><button class="btn primary" type="submit">Найти</button></form>
+    ${sbd.peek?`<div class="duel" style="box-shadow:none"><div class="duel-head"><h2>${esc(sbd.peek.name||'Соперник')} бросает вызов</h2><span class="badge">Вызов</span></div>
+      <div class="duel-meta">${esc(terms(sbd.peek))}. ${esc(METRICS[sbd.peek.metric]?.hint||'')}</div>${stake(sbd.peek)}
+      <div class="row"><button class="btn primary" data-sb="accept" data-id="${esc(sbd.peek.id)}" type="button">Принять вызов</button><button class="btn ghost" data-sb="peek-x" type="button">Отмена</button></div></div>`:''}</div>`;
+  if(incoming.length)h+='<h3 class="sect">Вам реванш</h3>'+incoming.map(d=>`<article class="duel"><div class="duel-head"><h2>${esc(nm(d.a))} хочет реванш</h2><span class="badge">Вызов</span></div>
+      <div class="duel-meta">${terms(d)}. ${METRICS[d.metric]?.hint||''}</div>${stake(d)}
+      <div class="row"><button class="btn primary" data-sb="accept" data-id="${d.id}" type="button">Принять</button></div></article>`).join('');
+  if(active.length)h+='<h3 class="sect">Идут сейчас</h3>'+active.map(d=>card(d,false)).join('');
+  if(waiting.length)h+='<h3 class="sect">Ждут соперника</h3>'+waiting.map(d=>`<article class="duel"><div class="duel-head"><h2>${d.invite?'Реванш для '+esc(nm(d.invite)):'Ваш вызов'}</h2><span class="badge wait">Ждём</span></div>
+      <div class="duel-meta">${terms(d)}. Отсчёт начнётся, когда соперник примет вызов.</div>${stake(d)}
+      ${d.invite?'<p class="hint">Соперник увидит реванш у себя на вкладке «Дуэли».</p>':`<div class="codebox"><span class="hint" style="margin:0">Код вызова</span><b>${d.id}</b></div>
+      <div class="row"><button class="btn primary" data-sb="share" data-id="${d.id}" type="button">Отправить код</button><button class="btn" data-sb="copy" data-id="${d.id}" type="button">Скопировать</button></div>
+      <p class="hint">Код видит только тот, кому вы его отправите. Первый, кто введёт код, станет вашим соперником.</p>`}
+      <div class="row"><button class="btn sm ghost danger" data-sb="cancel" data-id="${d.id}" type="button">Отменить вызов</button></div></article>`).join('');
+  if(finished.length)h+='<h3 class="sect">Завершённые</h3>'+finished.map(d=>card(d,true)).join('');
+  if(!active.length&&!waiting.length&&!finished.length&&!incoming.length)h+=`<div class="card empty"><h2>Соревнуйтесь вдвоём</h2><p>Создайте вызов ниже и отправьте код сопернику. Каждый тренируется сам, а счёт обновляется у обоих после тренировки.</p></div>`;
+  el.innerHTML=h;
+  const cf=$('#sbd-codef');if(cf)cf.onsubmit=e=>{e.preventDefault();peekCode($('#sbd-code').value)};
+  const ci=$('#sbd-code');if(ci)ci.oninput=e=>{sbd.code=e.target.value};
+};
+renderDuelForm=function(){
+  const el=$('#duel-form');if(!sb.me){el.innerHTML='';return}const f=sbd.f;
+  el.innerHTML=`<div class="card"><h2>Новая дуэль</h2>
+    <div class="fgroup"><span class="sect" style="margin:0">Что считаем</span><div class="seg" role="radiogroup" aria-label="Что считаем">${Object.entries(METRICS).map(([k,m])=>`<button role="radio" type="button" aria-checked="${f.metric===k}" data-sb="metric" data-v="${k}">${m.label}</button>`).join('')}</div>
+    <p class="hint">${METRICS[f.metric].hint}</p></div>
+    <div class="fgroup"><span class="sect" style="margin:0">Сколько длится</span><div class="seg" role="radiogroup" aria-label="Длительность">${[3,7,14].map(n=>`<button role="radio" type="button" aria-checked="${f.days===n}" data-sb="days" data-v="${n}">${n} дней</button>`).join('')}</div></div>
+    <label class="f">На кону, по желанию<input id="sbd-stake" maxlength="80" value="${esc(f.stake)}" placeholder="Например, кофе"></label>
+    <div class="row"><button class="btn primary" data-sb="create" type="button">Создать вызов и получить код</button></div></div>`;
+  $('#sbd-stake').oninput=e=>{f.stake=e.target.value};
+};
+async function peekCode(raw){const code=String(raw||'').toUpperCase().replace(/[^A-Z0-9]/g,'');sbd.code=code;sbd.peek=null;
+  if(code.length<6){flash('Код состоит из 6 символов — проверьте его.');renderDuels();return}
+  try{const j=await rest('rpc/peek_duel',{method:'POST',body:{code}});sbd.peek={...j,id:j.id};renderDuels()}
+  catch(e){flash(e.status===401?'Войдите, чтобы принять вызов.':/duel_unavailable/.test(e.message)?'Вызов не найден: код неверный, вызов отменён или его уже кто-то принял.':errRu(e));renderDuels()}}
+async function createSbDuel(src,invite){
+  for(let i=0;i<4;i++){const id=newCode();
+    try{await rest('duels',{method:'POST',body:{id,a:sb.me,invite:invite||null,metric:src.metric,days:src.days,stake:String(src.stake||'').trim().slice(0,80),created_at:Date.now()},prefer:'return=minimal'});
+      if(!invite){sbd.f.stake='';renderDuelForm()}
+      flash(invite?'Реванш отправлен: соперник увидит его на вкладке «Дуэли».':'Вызов создан. Отправьте код сопернику.');await loadDuels();return}
+    catch(e){if(e.status===409||e.code==='23505')continue;flash(errRu(e));return}}
+  flash('Не получилось создать код. Попробуйте ещё раз.')}
+async function shareCode(id){const text=`Вызываю тебя на дуэль в «Круговом тренере»! Код: ${id}\nОткрой приложение, вкладка «Дуэли» → «Принять вызов по коду»: ${shareUrl()}`;
+  if(navigator.share){try{await navigator.share({title:'Вызов на дуэль',text});return}catch(e){if(e&&e.name==='AbortError')return}}
+  copyCode(id,text)}
+async function copyCode(id,text){try{await navigator.clipboard.writeText(text||id);flash(text?'Сообщение с кодом скопировано — вставьте его в мессенджер.':'Код скопирован.')}catch(e){flash('Код: '+id+' — перепишите его сопернику.')}}
+$('#v-duel').addEventListener('click',async e=>{const b=e.target.closest('[data-sb]');if(!b)return;const a=b.dataset.sb,id=b.dataset.id;
+  if(a==='metric'){sbd.f.metric=b.dataset.v;renderDuelForm()}
+  else if(a==='days'){sbd.f.days=+b.dataset.v;renderDuelForm()}
+  else if(a==='create'){b.disabled=true;await createSbDuel(sbd.f);b.disabled=false}
+  else if(a==='share')shareCode(id);
+  else if(a==='copy')copyCode(id);
+  else if(a==='peek-x'){sbd.peek=null;sbd.code='';renderDuels()}
+  else if(a==='accept'){b.disabled=true;try{await rest('rpc/accept_duel',{method:'POST',body:{duel_id:id}});sbd.peek=null;sbd.code='';flash('Дуэль началась! Тренировки с этой минуты идут в зачёт.');await loadDuels()}
+    catch(e2){flash(/duel_unavailable/.test(e2.message)?'Этот вызов уже недоступен: его отменили или приняли.':errRu(e2));b.disabled=false}}
+  else if(a==='cancel'){if(!b.dataset.sure){b.dataset.sure='1';b.textContent='Точно отменить?';return}
+    try{await rest('duels?id=eq.'+encodeURIComponent(id),{method:'DELETE',prefer:'return=minimal'});flash('Вызов отменён.');await loadDuels()}catch(e2){flash(errRu(e2))}}
+  else if(a==='rematch'){const d=sbd.duels.find(x=>x.id===id);if(d){b.disabled=true;await createSbDuel(d,d.a===sb.me?d.b:d.a)}}
+});
+
+/* ---------- start-up ---------- */
+setInterval(()=>{if(sb.me&&document.visibilityState==='visible'&&view==='duel')loadDuels()},30000);
+setInterval(()=>{if(sb.me&&document.visibilityState==='visible')pull()},120000);
+document.addEventListener('visibilitychange',()=>{if(sb.me&&document.visibilityState==='visible')pull()});
+addEventListener('online',()=>{if(sb.me)pull()});
+(async function sbInit(){
+  const h=new URLSearchParams(location.hash.replace(/^#/,''));
+  if(h.get('error_description')||h.get('error')){sb.msg='Ссылка из письма не сработала: '+(h.get('error_description')||h.get('error'))+'. Возможно, она устарела — запросите новую.';sb.msgKind='err';history.replaceState(null,'',location.pathname+location.search);openAccount()}
+  else if(h.get('access_token')){const type=h.get('type');history.replaceState(null,'',location.pathname+location.search);
+    setSession({access_token:h.get('access_token'),refresh_token:h.get('refresh_token'),expires_in:+h.get('expires_in')||3600,expires_at:+h.get('expires_at')||undefined});
+    try{const u=await sbAuth('user',null,{method:'GET',auth:true});sb.session.user={id:u.id,email:u.email,name:(u.user_metadata&&u.user_metadata.name)||''};store.set(SESSION_KEY,sb.session)}
+    catch(e){setSession(null);sb.msg='Ссылка из письма устарела. Войдите с паролем или запросите новую ссылку.';sb.msgKind='err';openAccount()}
+    if(sb.session){if(type==='recovery'){sb.mode='recovery';sb.msg='';await afterSignIn();sb.mode='recovery';openAccount()}
+      else{await afterSignIn();if(sb.mode!=='name'){sb.mode='account';sb.msg='Почта подтверждена, вы вошли. Теперь войдите с этим же паролем и в приложении на экране «Домой».';sb.msgKind='ok';openAccount()}}}}
+  if(!sb.me){if(sb.session){await afterSignIn()}else setSync('sbout')}
+})();
 </script>
 </body>
 </html>

@@ -1,5 +1,5 @@
 // Offline support: the app is cached on first visit and opens without internet afterwards.
-const CACHE = 'trener-v2';
+const CACHE = 'trener-v3';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
