@@ -11,6 +11,7 @@ self.addEventListener('fetch', e => {
   const req = e.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
+  if (url.pathname.includes('/kvartira/')) return; // планировщик квартиры — отдельное приложение, не кэшируем
   if (req.mode === 'navigate') {
     // newest version when online, saved copy when offline
     e.respondWith(fetch(req).then(res => { const copy = res.clone(); caches.open(CACHE).then(c => c.put('./index.html', copy)); return res; })
